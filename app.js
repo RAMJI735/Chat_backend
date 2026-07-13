@@ -1,12 +1,14 @@
 require("dotenv").config();
 const http = require("http");
 const express = require("express");
+const cors = require("cors");
 const { Server } = require("socket.io");
 
 const mongoose = require("mongoose");
 const User = require("./models/User");
 
 const app = express();
+app.use(cors());
 const server = http.createServer(app);
 
 mongoose.connect(process.env.MONGO_URI || "mongodb://127.0.0.1:27017/socketchat")
@@ -87,6 +89,17 @@ io.on("connection", (socket) => {
 app.get("/", (req, res) => {
     res.send("hello")
 })
+
+app.get("/api/users/online", async (req, res) => {
+    try {
+        const allUsers = await User.find({}, 'username socketId -_id');
+        const users = allUsers.map(u => ({ username: u.username, socketId: u.socketId }));
+        res.json(users);
+    } catch (error) {
+        console.error("Error fetching online users:", error);
+        res.status(500).json({ error: "Server error" });
+    }
+});
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
