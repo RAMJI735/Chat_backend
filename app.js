@@ -19,16 +19,31 @@ const io = new Server(server, {
     cors: {
         origin: "*",
         methods: ["GET", "POST"]
-    }
+    },
+    // ⚡ Faster disconnect detection in production
+    pingInterval: 10000,
+    pingTimeout: 5000
 });
+
+/** Helper to fetch all online users */
+async function getAllOnlineUsers() {
+    try {
+        const allUsers = await User.find({}, 'username socketId -_id');
+        return allUsers.map(u => ({ username: u.username, socketId: u.socketId }));
+    } catch (error) {
+        console.error("Error fetching online users:", error);
+        return [];
+    }
+}
 
 io.on("connection", (socket) => {
     console.log("A user connected:", socket.id);
 
-    // Join a room based on user ID or some identifier if needed
     socket.on("join", async (username) => {
         try {
-            // Delete if somehow this socketId already exists to prevent duplicate key errors
+            // 🔥 Clean up: remove ALL stale entries for this username (e.g., from old/reconnected sockets)
+            await User.deleteMany({ username });
+            // Also remove any leftover entry with this exact socketId
             await User.deleteOne({ socketId: socket.id });
 
             const newUser = new User({
@@ -38,26 +53,23 @@ io.on("connection", (socket) => {
             await newUser.save();
             console.log(`User ${username} (${socket.id}) saved to DB`);
 
-            const allUsers = await User.find({}, 'username socketId -_id');
-            const users = allUsers.map(u => ({ username: u.username, socketId: u.socketId }));
-
-            // Sirf naye user ko bhejo (self)
+            // ✅ Fetch fresh users list and send to the newly joined user
+            const users = await getAllOnlineUsers();
             socket.emit("online_users", users);
 
-            // Baaki sabko batao ki naya user online aaya (others)
+            // Notify others that a new user is online
             socket.broadcast.emit("user_online", {
                 username,
                 socketId: socket.id
             });
         } catch (error) {
             console.error("Error saving user:", error);
+            // ⚠️ Even on error, send an empty list so the client doesn't hang forever
+            socket.emit("online_users", []);
         }
     });
 
     socket.on("send_message", (data) => {
-        console.log("Message received:", data);
-        // Broadcast the message to all clients
-        // socket.broadcast.emit("receive_message", data);
         socket.to(data.receiverId).emit("receive_message", data);
     });
 
@@ -84,21 +96,29 @@ io.on("connection", (socket) => {
     });
 });
 
-
-
 app.get("/", (req, res) => {
-    res.send("hello")
-})
+    res.send("SocketChat server is running")
+});
 
 app.get("/api/users/online", async (req, res) => {
     try {
-        const allUsers = await User.find({}, 'username socketId -_id');
-        const users = allUsers.map(u => ({ username: u.username, socketId: u.socketId }));
+        const users = await getAllOnlineUsers();
         res.json(users);
     } catch (error) {
         console.error("Error fetching online users:", error);
         res.status(500).json({ error: "Server error" });
     }
+});
+
+// ⚡ Health check endpoint for production monitoring
+app.get("/api/health", (req, res) => {
+    const mongoState = mongoose.connection.readyState;
+    const states = { 0: "disconnected", 1: "connected", 2: "connecting", 3: "disconnecting" };
+    res.json({
+        status: mongoState === 1 ? "ok" : "degraded",
+        mongo: states[mongoState] || "unknown",
+        uptime: process.uptime()
+    });
 });
 
 const PORT = process.env.PORT || 3000;
