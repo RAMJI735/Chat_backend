@@ -220,20 +220,133 @@ router.post("/logout", verifyToken, async (req, res) => {
 });
 
 
+// router.post("/match", verifyToken, async (req, res) => {
+//     try {
+//         const userId = req.user.id;
+//         const io = req.app.get("io") || req.io;
+
+//         const FindOnlineUser = await User.find({
+//             isOnline: true,
+//             _id: { $ne: userId }
+//         }).select("username avatar socketId country");
+
+//         if (FindOnlineUser.length === 0) {
+//             return res.status(404).json({
+//                 success: false,
+//                 message: "No online users found"
+//             });
+//         }
+
+//         const randomIndex = Math.floor(
+//             Math.random() * FindOnlineUser.length
+//         );
+
+//         const randomUser = FindOnlineUser[randomIndex];
+
+//         // Create match
+//         const match = await MatchUser.create({
+//             user1: userId,
+//             user2: randomUser._id,
+//             status: "connected"
+//         });
+
+//         // Current user's socket
+//         const currentUser = await User.findById(userId)
+//             .select("username avatar country socketId");
+
+//         // Join both users into the match room if sockets are connected
+//         if (io) {
+//             const matchRoomId = match._id.toString();
+//             if (currentUser?.socketId) {
+//                 const currentSocket = io.sockets.sockets.get(currentUser.socketId);
+//                 if (currentSocket) currentSocket.join(matchRoomId);
+//             }
+
+
+//             if (randomUser?.socketId) {
+//                 const randomSocket = io.sockets.sockets.get(randomUser.socketId);
+//                 if (randomSocket) randomSocket.join(matchRoomId);
+
+//                 // B ko batao ki uska match mil gaya
+//                 io.to(randomUser.socketId).emit("match_found", {
+//                     matchId: match._id,
+//                     user: {
+//                         _id: currentUser._id,
+//                         username: currentUser.username,
+//                         avatar: currentUser.avatar,
+//                         country: currentUser.country
+//                     }
+//                 });
+//             }
+//         }
+
+//         return res.status(200).json({
+//             success: true,
+//             matchId: match._id,
+//             user: randomUser
+//         });
+
+//     } catch (error) {
+//         console.error(error);
+
+//         return res.status(500).json({
+//             success: false,
+//             message: "Server error"
+//         });
+//     }
+// });
+
+
 router.post("/match", verifyToken, async (req, res) => {
     try {
         const userId = req.user.id;
         const io = req.app.get("io") || req.io;
 
+        // Current user's active match
+        const currentMatch = await MatchUser.findOne({
+            status: "connected",
+            $or: [
+                { user1: userId },
+                { user2: userId }
+            ]
+        });
+
+        if (currentMatch) {
+            return res.status(400).json({
+                success: false,
+                message: "You are already matched",
+                matchId: currentMatch._id
+            });
+        }
+
+        // Find all users who are already in an active match
+        const activeMatches = await MatchUser.find({
+            status: "connected"
+        }).select("user1 user2");
+
+        const matchedUserIds = [];
+
+        activeMatches.forEach((match) => {
+            matchedUserIds.push(match.user1);
+            matchedUserIds.push(match.user2);
+        });
+
+        // Find available online users
         const FindOnlineUser = await User.find({
             isOnline: true,
-            _id: { $ne: userId }
+
+            // Don't select current user
+            _id: {
+                $ne: userId,
+                $nin: matchedUserIds
+            }
+
         }).select("username avatar socketId country");
 
         if (FindOnlineUser.length === 0) {
             return res.status(404).json({
                 success: false,
-                message: "No online users found"
+                message: "No available users found"
             });
         }
 
@@ -254,20 +367,29 @@ router.post("/match", verifyToken, async (req, res) => {
         const currentUser = await User.findById(userId)
             .select("username avatar country socketId");
 
-        // Join both users into the match room if sockets are connected
         if (io) {
             const matchRoomId = match._id.toString();
+
+            // User A
             if (currentUser?.socketId) {
-                const currentSocket = io.sockets.sockets.get(currentUser.socketId);
-                if (currentSocket) currentSocket.join(matchRoomId);
+                const currentSocket =
+                    io.sockets.sockets.get(currentUser.socketId);
+
+                if (currentSocket) {
+                    currentSocket.join(matchRoomId);
+                }
             }
 
-            
+            // User B
             if (randomUser?.socketId) {
-                const randomSocket = io.sockets.sockets.get(randomUser.socketId);
-                if (randomSocket) randomSocket.join(matchRoomId);
+                const randomSocket =
+                    io.sockets.sockets.get(randomUser.socketId);
 
-                // B ko batao ki uska match mil gaya
+                if (randomSocket) {
+                    randomSocket.join(matchRoomId);
+                }
+
+                // Notify User B
                 io.to(randomUser.socketId).emit("match_found", {
                     matchId: match._id,
                     user: {
