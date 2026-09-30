@@ -2,6 +2,7 @@ const express = require("express");
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const { verifyToken } = require("../middleware/auth");
+const MatchUser = require("../models/matchUser");
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || "socketchat_jwt_secret_key_2026_super_secure";
@@ -13,6 +14,14 @@ const generateToken = (user) => {
         JWT_SECRET,
         { expiresIn: "7d" }
     );
+};
+
+// Cookie options for secure token storage
+const COOKIE_OPTIONS = {
+    httpOnly: true, // Prevents client-side scripts from accessing the token
+    secure: process.env.NODE_ENV === "production", // Requires HTTPS in production
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+    maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days in milliseconds
 };
 
 // 📝 Register / Sign Up
@@ -44,8 +53,8 @@ router.post("/register", async (req, res) => {
         }
 
         // Check if username already exists (case-insensitive)
-        const existingUsername = await User.findOne({ 
-            username: { $regex: new RegExp(`^${trimmedUsername}$`, "i") } 
+        const existingUsername = await User.findOne({
+            username: { $regex: new RegExp(`^${trimmedUsername}$`, "i") }
         });
         if (existingUsername) {
             return res.status(409).json({ success: false, message: "Username is already taken" });
@@ -73,6 +82,9 @@ router.post("/register", async (req, res) => {
         await newUser.save();
 
         const token = generateToken(newUser);
+
+        // Store token in HTTP-only cookie
+        res.cookie("token", token, COOKIE_OPTIONS);
 
         return res.status(201).json({
             success: true,
@@ -119,9 +131,9 @@ router.post("/login", async (req, res) => {
 
         // If user was created without password (legacy guest)
         if (!user.password) {
-            return res.status(400).json({ 
-                success: false, 
-                message: "This account does not have a password set. Please sign up to create your account credentials." 
+            return res.status(400).json({
+                success: false,
+                message: "This account does not have a password set. Please sign up to create your account credentials."
             });
         }
 
@@ -131,6 +143,9 @@ router.post("/login", async (req, res) => {
         }
 
         const token = generateToken(user);
+
+        // Store token in HTTP-only cookie
+        res.cookie("token", token, COOKIE_OPTIONS);
 
         return res.status(200).json({
             success: true,
@@ -177,27 +192,22 @@ router.get("/me", verifyToken, async (req, res) => {
 });
 
 // 🚪 Logout
-router.post("/logout", async (req, res) => {
+router.post("/logout", verifyToken, async (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
-        if (authHeader && authHeader.startsWith("Bearer ")) {
-            const token = authHeader.split(" ")[1];
-            try {
-                const decoded = jwt.verify(
-                    token,
-                    process.env.JWT_SECRET || "socketchat_jwt_secret_key_2026_super_secure"
-                );
-                if (decoded && decoded.id) {
-                    await User.findByIdAndUpdate(decoded.id, {
-                        isOnline: false,
-                        socketId: null,
-                        lastSeen: new Date()
-                    });
-                }
-            } catch (err) {
-                // If token is expired or invalid, still allow client logout to succeed
-            }
+        if (req.user && req.user._id) {
+            await User.findByIdAndUpdate(req.user._id, {
+                isOnline: false,
+                socketId: null,
+                lastSeen: new Date()
+            });
         }
+
+        // Clear the token cookie
+        res.clearCookie("token", {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === "production",
+            sameSite: process.env.NODE_ENV === "production" ? "none" : "lax"
+        });
 
         return res.status(200).json({
             success: true,
@@ -209,5 +219,81 @@ router.post("/logout", async (req, res) => {
     }
 });
 
+
+router.post("/match", verifyToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const io = req.app.get("io") || req.io;
+
+        const FindOnlineUser = await User.find({
+            isOnline: true,
+            _id: { $ne: userId }
+        }).select("username avatar socketId country");
+
+        if (FindOnlineUser.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "No online users found"
+            });
+        }
+
+        const randomIndex = Math.floor(
+            Math.random() * FindOnlineUser.length
+        );
+
+        const randomUser = FindOnlineUser[randomIndex];
+
+        // Create match
+        const match = await MatchUser.create({
+            user1: userId,
+            user2: randomUser._id,
+            status: "connected"
+        });
+
+        // Current user's socket
+        const currentUser = await User.findById(userId)
+            .select("username avatar country socketId");
+
+        // Join both users into the match room if sockets are connected
+        if (io) {
+            const matchRoomId = match._id.toString();
+            if (currentUser?.socketId) {
+                const currentSocket = io.sockets.sockets.get(currentUser.socketId);
+                if (currentSocket) currentSocket.join(matchRoomId);
+            }
+
+            
+            if (randomUser?.socketId) {
+                const randomSocket = io.sockets.sockets.get(randomUser.socketId);
+                if (randomSocket) randomSocket.join(matchRoomId);
+
+                // B ko batao ki uska match mil gaya
+                io.to(randomUser.socketId).emit("match_found", {
+                    matchId: match._id,
+                    user: {
+                        _id: currentUser._id,
+                        username: currentUser.username,
+                        avatar: currentUser.avatar,
+                        country: currentUser.country
+                    }
+                });
+            }
+        }
+
+        return res.status(200).json({
+            success: true,
+            matchId: match._id,
+            user: randomUser
+        });
+
+    } catch (error) {
+        console.error(error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Server error"
+        });
+    }
+});
 module.exports = router;
 

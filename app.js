@@ -2,11 +2,13 @@ require("dotenv").config();
 const http = require("http");
 const express = require("express");
 const cors = require("cors");
+const cookieParser = require("cookie-parser");
 const { Server } = require("socket.io");
 const mongoose = require("mongoose");
 
 const connectDB = require("./config/db");
 const User = require("./models/User");
+const Match = require("./models/matchUser");
 const authRoutes = require("./routes/auth");
 
 const app = express();
@@ -14,19 +16,26 @@ const app = express();
 // Connect to MongoDB
 connectDB();
 
+// CORS origin configuration
+const allowedOrigin = process.env.FRONTEND_URL && process.env.FRONTEND_URL !== "*"
+    ? process.env.FRONTEND_URL
+    : true;
+
 // Middleware
-app.use(cors());
+app.use(cors({
+    origin: allowedOrigin,
+    credentials: true
+}));
+app.use(cookieParser());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// Authentication API Routes
-app.use("/api/auth", authRoutes);
 
 const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: {
-        origin: process.env.FRONTEND_URL || "*",
+        origin: allowedOrigin,
+        credentials: true,
         methods: ["GET", "POST"]
     },
     // ⚡ Faster disconnect detection in production
@@ -34,139 +43,23 @@ const io = new Server(server, {
     pingTimeout: 5000
 });
 
-// ==========================================
-// 🎲 RANDOM CHAT / MATCHMAKING STATE
-// ==========================================
-// Queue of sockets waiting to be matched: [{ socketId, username, avatar, country, bio }]
-let waitingQueue = [];
+// Provide io instance to Express app and req objects
+app.set("io", io);
+app.use((req, res, next) => {
+    req.io = io;
+    next();
+});
 
-// Active pairs: Map<socketId, { partnerSocketId, roomId, partner: { username, avatar, country, bio } }>
-const activeMatches = new Map();
+// Authentication API Routes
+app.use("/api/auth", authRoutes);
 
-/** Helper to broadcast total online count without revealing user identities */
+// Helper to broadcast total online count
 async function broadcastOnlineCount() {
     try {
         const count = await User.countDocuments({ isOnline: true });
         io.emit("online_count", { onlineCount: count });
     } catch (error) {
         console.error("Error broadcasting online count:", error);
-    }
-}
-
-/** Helper to cleanly end an active match between two users */
-function endMatch(socketId, reason = "left") {
-    const match = activeMatches.get(socketId);
-    if (!match) return;
-
-    const partnerSocketId = match.partnerSocketId;
-    const partnerSocket = io.sockets.sockets.get(partnerSocketId);
-
-    if (partnerSocket) {
-        if (reason === "skip") {
-            partnerSocket.emit("partner_left", { message: "Stranger skipped the chat." });
-        } else if (reason === "disconnect") {
-            partnerSocket.emit("partner_disconnected", { message: "Stranger disconnected." });
-        } else {
-            partnerSocket.emit("partner_left", { message: "Stranger left the chat." });
-        }
-        partnerSocket.leave(match.roomId);
-    }
-
-    const currentSocket = io.sockets.sockets.get(socketId);
-    if (currentSocket) {
-        currentSocket.leave(match.roomId);
-    }
-
-    activeMatches.delete(partnerSocketId);
-    activeMatches.delete(socketId);
-}
-
-/** Helper to match a socket with a random waiting partner */
-async function matchRandomUser(socket) {
-    // 1. If currently in a match, leave it
-    endMatch(socket.id, "skip");
-
-    // 2. Remove socket from waiting queue if already there
-    waitingQueue = waitingQueue.filter((item) => item.socketId !== socket.id);
-
-    // 3. Find valid candidate from waiting queue
-    let partner = null;
-    while (waitingQueue.length > 0) {
-        const candidate = waitingQueue.shift();
-        // Check if candidate socket is still alive and not self
-        const candidateSocket = io.sockets.sockets.get(candidate.socketId);
-        if (candidateSocket && candidate.socketId !== socket.id) {
-            partner = candidate;
-            break;
-        }
-    }
-
-    // 4. If partner found, pair them!
-    if (partner) {
-        const partnerSocket = io.sockets.sockets.get(partner.socketId);
-        const currentUser = await User.findOne({ socketId: socket.id });
-
-        const currentUserInfo = {
-            socketId: socket.id,
-            username: currentUser?.username || "Stranger",
-            avatar: currentUser?.avatar || "",
-            country: currentUser?.country || "",
-            bio: currentUser?.bio || ""
-        };
-
-        const partnerUserInfo = {
-            socketId: partner.socketId,
-            username: partner.username || "Stranger",
-            avatar: partner.avatar || "",
-            country: partner.country || "",
-            bio: partner.bio || ""
-        };
-
-        const roomId = `room_${Date.now()}_${socket.id.slice(0, 5)}_${partner.socketId.slice(0, 5)}`;
-
-        socket.join(roomId);
-        partnerSocket.join(roomId);
-
-        activeMatches.set(socket.id, {
-            partnerSocketId: partner.socketId,
-            roomId,
-            partner: partnerUserInfo
-        });
-
-        activeMatches.set(partner.socketId, {
-            partnerSocketId: socket.id,
-            roomId,
-            partner: currentUserInfo
-        });
-
-        console.log(`🎲 Match created: ${currentUserInfo.username} <--> ${partnerUserInfo.username} in ${roomId}`);
-
-        // Emit match event to both users
-        socket.emit("match_found", {
-            roomId,
-            partner: partnerUserInfo
-        });
-
-        partnerSocket.emit("match_found", {
-            roomId,
-            partner: currentUserInfo
-        });
-    } else {
-        // 5. No partner available, put this user in waiting queue
-        const currentUser = await User.findOne({ socketId: socket.id });
-
-        waitingQueue.push({
-            socketId: socket.id,
-            username: currentUser?.username || "Stranger",
-            avatar: currentUser?.avatar || "",
-            country: currentUser?.country || "",
-            bio: currentUser?.bio || ""
-        });
-
-        socket.emit("waiting_for_partner", {
-            message: "Looking for a random stranger to connect..."
-        });
-        console.log(`⏳ User (${socket.id}) added to waiting queue. Queue size: ${waitingQueue.length}`);
     }
 }
 
@@ -177,36 +70,68 @@ io.on("connection", (socket) => {
     console.log("A user connected:", socket.id);
 
     // Initial connection registration
-    socket.on("join", async (username) => {
+    socket.on("join", async (data) => {
         try {
+            let query = null;
+
+            if (data && typeof data === "object") {
+                if (data.userId || data._id) {
+                    query = { _id: data.userId || data._id };
+                } else if (data.username) {
+                    query = { username: data.username };
+                }
+            } else if (typeof data === "string" && data.trim()) {
+                const trimmed = data.trim();
+                if (mongoose.Types.ObjectId.isValid(trimmed) && trimmed.length === 24) {
+                    query = { $or: [{ _id: trimmed }, { username: trimmed }] };
+                } else {
+                    query = { username: trimmed };
+                }
+            }
+
+            if (!query) {
+                return socket.emit("error_message", { message: "Invalid join payload" });
+            }
+
             // Remove any stale connection associated with this socketId
             await User.updateMany({ socketId: socket.id }, { socketId: null, isOnline: false });
 
-            // Upsert user and mark online
-            const user = await User.findOneAndUpdate(
-                { username },
-                {
-                    socketId: socket.id,
-                    isOnline: true,
-                    lastSeen: new Date()
-                },
-                { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
-            );
+            // Update user with current socketId and mark online
+            let user;
+            if (query._id) {
+                user = await User.findByIdAndUpdate(
+                    query._id,
+                    { socketId: socket.id, isOnline: true, lastSeen: new Date() },
+                    { returnDocument: "after" }
+                );
+            } else {
+                user = await User.findOneAndUpdate(
+                    query,
+                    { socketId: socket.id, isOnline: true, lastSeen: new Date() },
+                    { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
+                );
+            }
 
-            console.log(`User ${username} connected with socket ${socket.id}`);
+            if (!user) {
+                return socket.emit("error_message", { message: "User not found" });
+            }
 
-            // Acknowledge connection without exposing other users' identities
+            socket.userId = user._id.toString();
+            socket.username = user.username;
+
+            console.log(`User ${user.username} (${user._id}) connected with socket ${socket.id}`);
+
             socket.emit("joined", {
                 success: true,
                 message: "Connected to chat server",
                 user: {
+                    id: user._id,
                     username: user.username,
                     avatar: user.avatar,
                     country: user.country
                 }
             });
 
-            // Broadcast updated anonymous online count
             await broadcastOnlineCount();
         } catch (error) {
             console.error("Error on join:", error);
@@ -214,61 +139,175 @@ io.on("connection", (socket) => {
         }
     });
 
-    // 🎯 Trigger random matchmaking
-    socket.on("find_match", async () => {
-        await matchRandomUser(socket);
-    });
-
-    // ⏭️ Skip current stranger and find the next random partner
-    socket.on("next_partner", async () => {
-        console.log(`User ${socket.id} requested next partner`);
-        await matchRandomUser(socket);
-    });
-
-    // 🛑 Cancel waiting in queue
-    socket.on("cancel_search", () => {
-        waitingQueue = waitingQueue.filter((item) => item.socketId !== socket.id);
-        socket.emit("search_cancelled", { message: "Stopped searching for a match" });
-        console.log(`User ${socket.id} cancelled search. Queue size: ${waitingQueue.length}`);
-    });
-
-    // 🚪 Leave current random chat without queueing again
-    socket.on("leave_chat", () => {
-        endMatch(socket.id, "left");
-        socket.emit("chat_left", { message: "You left the chat." });
-    });
-
-    // 💬 Send 1-on-1 message (auto-routes to matched partner or specific receiverId)
-    socket.on("send_message", (data) => {
-        const match = activeMatches.get(socket.id);
-        const targetSocketId = data?.receiverId || (match ? match.partnerSocketId : null);
-
-        if (targetSocketId) {
-            socket.to(targetSocketId).emit("receive_message", {
-                text: data.text,
-                message: data.message || data.text,
-                senderId: socket.id,
-                timestamp: new Date().toISOString()
-            });
-        } else {
-            socket.emit("error_message", { message: "No active chat partner. Click Find Match first." });
+    // 🎯 Explicitly join a match room
+    socket.on("join_match", ({ matchId }) => {
+        if (matchId) {
+            socket.join(String(matchId));
+            console.log(`Socket ${socket.id} joined room ${matchId}`);
         }
     });
 
-    // ✍️ Typing indicators routed to matched partner
+    // 🎲 Trigger random matchmaking via Socket (alternative/complement to REST /match)
+    socket.on("find_match", async (data = {}) => {
+        try {
+            const currentUserId = socket.userId || data?.userId;
+            const currentUser = currentUserId
+                ? await User.findById(currentUserId)
+                : await User.findOne({ socketId: socket.id });
+
+            if (!currentUser) {
+                return socket.emit("error_message", { message: "Please join with your user info first." });
+            }
+
+            // Find an online user other than self
+            const availableUsers = await User.find({
+                isOnline: true,
+                _id: { $ne: currentUser._id },
+                socketId: { $ne: null }
+            }).select("username avatar socketId country");
+
+            if (availableUsers.length === 0) {
+                return socket.emit("waiting_for_partner", {
+                    message: "Looking for online users to connect..."
+                });
+            }
+
+            const randomIndex = Math.floor(Math.random() * availableUsers.length);
+            const randomUser = availableUsers[randomIndex];
+
+            const match = await Match.create({
+                user1: currentUser._id,
+                user2: randomUser._id,
+                status: "connected"
+            });
+
+            const matchRoomId = match._id.toString();
+            socket.join(matchRoomId);
+
+            if (randomUser.socketId) {
+                const partnerSocket = io.sockets.sockets.get(randomUser.socketId);
+                if (partnerSocket) partnerSocket.join(matchRoomId);
+
+                io.to(randomUser.socketId).emit("match_found", {
+                    matchId: match._id,
+                    user: {
+                        _id: currentUser._id,
+                        username: currentUser.username,
+                        avatar: currentUser.avatar,
+                        country: currentUser.country
+                    }
+                });
+            }
+
+            socket.emit("match_found", {
+                matchId: match._id,
+                user: {
+                    _id: randomUser._id,
+                    username: randomUser.username,
+                    avatar: randomUser.avatar,
+                    country: randomUser.country
+                }
+            });
+        } catch (error) {
+            console.error("Error in find_match socket:", error);
+            socket.emit("error_message", { message: "Failed to find match" });
+        }
+    });
+
+    // ⏭️ Skip current stranger / Next partner
+    socket.on("next_partner", async (data = {}) => {
+        const matchId = data?.matchId;
+        if (matchId) {
+            try {
+                await Match.findByIdAndDelete(matchId);
+                socket.to(String(matchId)).emit("partner_left", {
+                    matchId,
+                    message: "Stranger skipped the chat."
+                });
+                socket.leave(String(matchId));
+            } catch (err) {
+                console.error("Error deleting match on next_partner:", err);
+            }
+        }
+    });
+
+    // 🚪 Leave current chat / End match
+    socket.on("leave_match", async (data = {}) => {
+        const matchId = data?.matchId;
+        if (matchId) {
+            try {
+                await Match.findByIdAndDelete(matchId);
+                socket.to(String(matchId)).emit("partner_left", {
+                    matchId,
+                    message: "Stranger left the chat."
+                });
+                socket.leave(String(matchId));
+            } catch (err) {
+                console.error("Error deleting match on leave_match:", err);
+            }
+        }
+        socket.emit("chat_left", { message: "You left the chat." });
+    });
+
+    socket.on("leave_chat", async (data = {}) => {
+        const matchId = data?.matchId;
+        if (matchId) {
+            try {
+                await Match.findByIdAndDelete(matchId);
+                socket.to(String(matchId)).emit("partner_left", {
+                    matchId,
+                    message: "Stranger left the chat."
+                });
+                socket.leave(String(matchId));
+            } catch (err) {
+                console.error("Error deleting match on leave_chat:", err);
+            }
+        }
+        socket.emit("chat_left", { message: "You left the chat." });
+    });
+
+    // 💬 Send 1-on-1 message (routes to match room or receiver socket)
+    socket.on("send_message", (data) => {
+        const messagePayload = {
+            matchId: data?.matchId,
+            text: data?.text || data?.message || "",
+            message: data?.message || data?.text || "",
+            senderId: socket.id,
+            senderUserId: socket.userId,
+            timestamp: new Date().toISOString()
+        };
+
+        if (data?.matchId) {
+            socket.to(String(data.matchId)).emit("receive_message", messagePayload);
+        } else if (data?.receiverSocketId) {
+            socket.to(data.receiverSocketId).emit("receive_message", messagePayload);
+        } else if (data?.receiverId) {
+            socket.to(data.receiverId).emit("receive_message", messagePayload);
+        } else {
+            socket.emit("error_message", { message: "No active chat partner or matchId provided." });
+        }
+    });
+
+    // ✍️ Typing indicators
     socket.on("typing", (data = {}) => {
-        const match = activeMatches.get(socket.id);
-        const targetSocketId = data?.receiverId || (match ? match.partnerSocketId : null);
-        if (targetSocketId) {
-            socket.to(targetSocketId).emit("typing", { senderId: socket.id });
+        const payload = { senderId: socket.id, matchId: data?.matchId };
+        if (data?.matchId) {
+            socket.to(String(data.matchId)).emit("typing", payload);
+        } else if (data?.receiverSocketId) {
+            socket.to(data.receiverSocketId).emit("typing", payload);
+        } else if (data?.receiverId) {
+            socket.to(data.receiverId).emit("typing", payload);
         }
     });
 
     socket.on("stop_typing", (data = {}) => {
-        const match = activeMatches.get(socket.id);
-        const targetSocketId = data?.receiverId || (match ? match.partnerSocketId : null);
-        if (targetSocketId) {
-            socket.to(targetSocketId).emit("stop_typing", { senderId: socket.id });
+        const payload = { senderId: socket.id, matchId: data?.matchId };
+        if (data?.matchId) {
+            socket.to(String(data.matchId)).emit("stop_typing", payload);
+        } else if (data?.receiverSocketId) {
+            socket.to(data.receiverSocketId).emit("stop_typing", payload);
+        } else if (data?.receiverId) {
+            socket.to(data.receiverId).emit("stop_typing", payload);
         }
     });
 
@@ -276,18 +315,27 @@ io.on("connection", (socket) => {
     socket.on("disconnect", async () => {
         console.log("User disconnected:", socket.id);
 
-        // 1. Remove from waiting queue if waiting
-        waitingQueue = waitingQueue.filter((item) => item.socketId !== socket.id);
-
-        // 2. End active match and inform partner
-        endMatch(socket.id, "disconnect");
-
-        // 3. Mark offline in DB
         try {
-            await User.findOneAndUpdate(
+            const user = await User.findOneAndUpdate(
                 { socketId: socket.id },
-                { socketId: null, isOnline: false, lastSeen: new Date() }
+                { socketId: null, isOnline: false, lastSeen: new Date() },
+                { returnDocument: "after" }
             );
+
+            if (user) {
+                // Find and delete any active match involving this user
+                const activeMatch = await Match.findOneAndDelete({
+                    $or: [{ user1: user._id }, { user2: user._id }]
+                });
+
+                if (activeMatch) {
+                    io.to(String(activeMatch._id)).emit("partner_disconnected", {
+                        matchId: activeMatch._id,
+                        message: "Stranger disconnected."
+                    });
+                }
+            }
+
             await broadcastOnlineCount();
         } catch (error) {
             console.error("Error updating user on disconnect:", error);
@@ -333,16 +381,22 @@ app.get("/api/users/profile/:username", async (req, res) => {
 });
 
 // ⚡ Health check endpoint
-app.get("/api/health", (req, res) => {
-    const mongoState = mongoose.connection.readyState;
-    const states = { 0: "disconnected", 1: "connected", 2: "connecting", 3: "disconnecting" };
-    res.json({
-        status: mongoState === 1 ? "ok" : "degraded",
-        mongo: states[mongoState] || "unknown",
-        waitingQueueLength: waitingQueue.length,
-        activeMatchesCount: activeMatches.size / 2,
-        uptime: process.uptime()
-    });
+app.get("/api/health", async (req, res) => {
+    try {
+        const mongoState = mongoose.connection.readyState;
+        const states = { 0: "disconnected", 1: "connected", 2: "connecting", 3: "disconnecting" };
+        const activeMatchesCount = await Match.countDocuments({ status: "connected" });
+        const onlineCount = await User.countDocuments({ isOnline: true });
+        res.json({
+            status: mongoState === 1 ? "ok" : "degraded",
+            mongo: states[mongoState] || "unknown",
+            onlineUsers: onlineCount,
+            activeMatchesCount,
+            uptime: process.uptime()
+        });
+    } catch (err) {
+        res.status(500).json({ status: "error", error: err.message });
+    }
 });
 
 const PORT = process.env.PORT || 3000;
