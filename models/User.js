@@ -1,4 +1,4 @@
-﻿const mongoose = require("mongoose");
+const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 
 const userSchema = new mongoose.Schema(
@@ -46,8 +46,7 @@ const userSchema = new mongoose.Schema(
         },
         socketId: {
             type: String,
-            default: null,
-            sparse: true
+            default: null
         },
         isOnline: {
             type: Boolean,
